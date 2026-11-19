@@ -1,12 +1,19 @@
 """
-Pulls the cost + context window + provider route for known models from https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
+The Python host of the model cost map, https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
 
-This can be disabled by setting the LITELLM_LOCAL_MODEL_COST_MAP environment variable to True.
-The ``lite`` and ``litellm-proxy`` CLI entry points also use the bundled map without fetching.
+Invariant: the Rust core holds the logic every host shares, and each host owns its data.
 
-```
-export LITELLM_LOCAL_MODEL_COST_MAP=True
-```
+- The Rust core (``litellm/rust/crates/model-catalog`` and ``model-catalog-refresh``) owns what a cost map is and how a
+  newer one is obtained: where a document comes from, fetching and retrying, the checks a document must pass, the rule
+  that turns the remote map off, the defaults, and the wording of a failure. The Rust gateway runs the same code.
+- This module owns what only the Python host has. It reads its settings and hands the values to the core. It decides
+  when a refresh runs: at import on a background thread, on a reload, before returning under uWSGI, and again in a
+  forked child. It owns the data: ``litellm.model_cost`` with the provider model sets and ``register_model`` calls on top.
+
+A rule the Rust gateway would also need does not belong in this file.
+
+``LITELLM_LOCAL_MODEL_COST_MAP=True`` or offline mode turns the remote map off. The ``lite`` and ``litellm-proxy`` CLI
+entry points also serve the bundled map without fetching.
 """
 
 import atexit
@@ -30,11 +37,8 @@ from pydantic import JsonValue, TypeAdapter
 from typing_extensions import ReadOnly, TypedDict
 
 from litellm import verbose_logger
-from litellm.constants import (
-    MODEL_COST_MAP_MAX_SHRINK_RATIO,
-    MODEL_COST_MAP_MIN_MODEL_COUNT,
-)
 from litellm.litellm_core_utils import model_cost_table
+from litellm.litellm_core_utils.env_utils import get_env_float_or_none, get_env_int_or_none
 from litellm.litellm_core_utils.fallback_generalizations import (
     set_fallback_generalizations,
 )
@@ -43,6 +47,7 @@ from litellm.litellm_core_utils.model_cost_table import (
 )
 from litellm.litellm_core_utils.offline_mode import is_offline_mode
 from litellm.rust_bridge._native import (
+    CostMapKept,
     CostMapRefreshed,
     CostMapRefreshStop,
     NativeCostMapSource,
@@ -58,13 +63,11 @@ _CATALOG_ADAPTER: Final = TypeAdapter(dict[str, dict[str, object]])
 FALLBACK_GENERALIZATIONS_KEY: Final = "fallback_generalizations"
 RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", FALLBACK_GENERALIZATIONS_KEY})
 RETRYABLE_FETCH_STATUS_CODES: Final = frozenset({429, 500, 502, 503, 504})
-MODEL_COST_MAP_FETCH_MAX_ATTEMPTS: Final = 3
-MODEL_COST_MAP_FETCH_MAX_WAIT_SECONDS: Final = 30.0
-MODEL_COST_MAP_FETCH_MIN_DELAY_SECONDS: Final = 2.0
 _litellm_import_complete = threading.Event()
 
 model_cost_inputs: Final = NativeModelCostMap.bundled(
-    min_model_count=MODEL_COST_MAP_MIN_MODEL_COUNT, max_shrink_ratio=MODEL_COST_MAP_MAX_SHRINK_RATIO
+    min_model_count=get_env_int_or_none("MODEL_COST_MAP_MIN_MODEL_COUNT"),
+    max_shrink_ratio=get_env_float_or_none("MODEL_COST_MAP_MAX_SHRINK_RATIO"),
 )
 
 
@@ -76,9 +79,15 @@ def _is_uwsgi_process() -> bool:
     return "uwsgi" in sys.modules
 
 
-def _uses_bundled_map_only() -> bool:
+def _remote(url: str, use_http_settings: bool) -> NativeCostMapSource | None:
+    """The remote cost map, or ``None`` when this process serves the bundled one only."""
     # Can't use get_secret_bool here: this runs during litellm.__init__ before litellm._key_management_settings is set
-    return is_offline_mode() or os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true"
+    return NativeCostMapSource.remote(
+        url,
+        local_only=os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true",
+        offline=is_offline_mode(),
+        use_http_settings=use_http_settings,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,8 +157,8 @@ class GetModelCostMap:
     def _check_model_count_not_reduced(
         fetched_map: Mapping[str, object],
         backup_model_count: int,
-        min_model_count: int = MODEL_COST_MAP_MIN_MODEL_COUNT,
-        max_shrink_ratio: float = MODEL_COST_MAP_MAX_SHRINK_RATIO,
+        min_model_count: int = model_cost_inputs.min_model_count,
+        max_shrink_ratio: float = model_cost_inputs.max_shrink_ratio,
     ) -> bool:
         fetched_count: Final = _count_model_entries(fetched_map)
         if fetched_count < min_model_count:
@@ -171,8 +180,8 @@ class GetModelCostMap:
     def validate_model_cost_map(
         fetched_map: object,
         backup_model_count: int,
-        min_model_count: int = MODEL_COST_MAP_MIN_MODEL_COUNT,
-        max_shrink_ratio: float = MODEL_COST_MAP_MAX_SHRINK_RATIO,
+        min_model_count: int = model_cost_inputs.min_model_count,
+        max_shrink_ratio: float = model_cost_inputs.max_shrink_ratio,
     ) -> bool:
         """Compat for main's callers. Rust checks fetched documents in ``model_cost_inputs.install``."""
         return isinstance(fetched_map, dict) and (
@@ -281,13 +290,9 @@ def cost_map_source(url: str, use_http_settings: bool) -> NativeCostMapSource:
     return NativeCostMapSource(url, use_http_settings=use_http_settings)
 
 
-def fetch_policy(timeout: float, max_attempts: int) -> NativeFetchPolicy:
-    return NativeFetchPolicy(
-        max_attempts=max_attempts,
-        max_wait_seconds=MODEL_COST_MAP_FETCH_MAX_WAIT_SECONDS,
-        timeout_seconds=timeout,
-        min_delay_seconds=MODEL_COST_MAP_FETCH_MIN_DELAY_SECONDS,
-    )
+def fetch_policy(timeout: float | None, max_attempts: int | None) -> NativeFetchPolicy:
+    """The core's retry policy, with the two numbers a caller of the public functions may set."""
+    return NativeFetchPolicy(max_attempts=max_attempts, timeout_seconds=timeout)
 
 
 def _set_fallback_rules(block: JsonValue) -> None:
@@ -335,18 +340,6 @@ def _mark_rows_with_rules_set(
     _LastLoad.current = ModelCostMapSourceInfo(source, url, is_env_forced, fallback_reason, loaded_at)
 
 
-def _rejected_reason(rejected: NativeRejected, url: str) -> str:
-    if rejected.integrity:
-        return f"model cost map from {url} failed integrity validation"
-    return f"invalid JSON from {url}: {rejected.reason}"
-
-
-def _warn_rejected(rejected: NativeRejected, url: str) -> None:
-    verbose_logger.warning(
-        "LiteLLM: Fetched model cost map from %s was rejected (%s). Using local backup instead.", url, rejected.reason
-    )
-
-
 def _warn_ignored_fetch_hooks(sleep: object, rng: object, client: object) -> None:
     if (sleep, rng, client) != (None, None, None):
         warnings.warn(
@@ -358,8 +351,8 @@ def _warn_ignored_fetch_hooks(sleep: object, rng: object, client: object) -> Non
 
 async def refetch_model_cost_map(
     url: str,
-    timeout: int = 5,
-    max_attempts: int = MODEL_COST_MAP_FETCH_MAX_ATTEMPTS,
+    timeout: float | None = None,
+    max_attempts: int | None = None,
     sleep: object = None,
     rng: object = None,
     client: object = None,
@@ -374,20 +367,17 @@ async def refetch_model_cost_map(
     """
     _warn_ignored_fetch_hooks(sleep, rng, client)
 
-    if _uses_bundled_map_only():
+    source: Final = _remote(url, use_http_settings=True)
+    if source is None:
         _mark_rows_with_rules_set("local", None, True, None, datetime.now(timezone.utc))
         return ModelCostMapReloaded(model_count=_install(model_cost_inputs.install_bundled()))
 
-    refreshed: Final = await model_cost_inputs.refresh(
-        cost_map_source(url, use_http_settings=True), fetch_policy(timeout, max_attempts)
-    )
-    if not isinstance(refreshed, CostMapRefreshed):
+    refreshed: Final = await model_cost_inputs.refresh(source, fetch_policy(timeout, max_attempts))
+    if isinstance(refreshed, CostMapKept):
         verbose_logger.warning(
-            "LiteLLM: model cost map reload failed: %s. Keeping the currently loaded map.", refreshed.reason
+            "LiteLLM: model cost map reload failed: %s. Keeping the currently loaded map.", refreshed.detail
         )
-        return ModelCostMapReloadUnavailable(
-            reason=refreshed.reason if isinstance(refreshed, NativeFetchFailed) else _rejected_reason(refreshed, url)
-        )
+        return ModelCostMapReloadUnavailable(reason=refreshed.reason)
     _mark_rows_with_rules_set("remote", url, False, None, datetime.now(timezone.utc))
     return ModelCostMapReloaded(model_count=_install(model_cost_inputs.install_refreshed(refreshed)))
 
@@ -397,9 +387,10 @@ class _BootRefresh:
     """The background refresh a boot load started. ``ended`` lets a forked child tell whether it finished, and
     ``stop`` ends its download when the interpreter exits."""
 
+    source: NativeCostMapSource
     url: str
-    timeout: int
-    max_attempts: int
+    timeout: float | None
+    max_attempts: int | None
     started: datetime
     ended: threading.Event = field(default_factory=threading.Event)
     stop: CostMapRefreshStop = field(default_factory=CostMapRefreshStop)
@@ -418,29 +409,15 @@ def _refreshed(boot: _BootRefresh) -> CostMapRefreshed | None:
     """The document at ``boot.url``. ``None`` after recording why the local backup stays, and also when the refresh
     was stopped or a later load replaced this one."""
     refreshed: Final = model_cost_inputs.refresh_blocking(
-        cost_map_source(boot.url, use_http_settings=False), fetch_policy(boot.timeout, boot.max_attempts), boot.stop
+        boot.source, fetch_policy(boot.timeout, boot.max_attempts), boot.stop
     )
     if refreshed is None or _replaced_by_a_later_load(boot):
         return None
-    if isinstance(refreshed, NativeFetchFailed):
+    if isinstance(refreshed, CostMapKept):
         verbose_logger.warning(
-            "LiteLLM: Failed to fetch remote model cost map from %s: %s. Keeping the local backup.",
-            boot.url,
-            refreshed.reason,
+            "LiteLLM: Remote model cost map was not installed (%s). Keeping the local backup.", refreshed.detail
         )
-        _mark_rows_with_rules_set("local", boot.url, False, f"Remote fetch failed: {refreshed.reason}", boot.started)
-        return None
-    if isinstance(refreshed, NativeRejected):
-        _warn_rejected(refreshed, boot.url)
-        _mark_rows_with_rules_set(
-            "local",
-            boot.url,
-            False,
-            "Remote data failed integrity validation"
-            if refreshed.integrity
-            else f"Remote fetch failed: {_rejected_reason(refreshed, boot.url)}",
-            boot.started,
-        )
+        _mark_rows_with_rules_set("local", boot.url, False, refreshed.fallback_reason, boot.started)
         return None
     return refreshed
 
@@ -462,8 +439,7 @@ def _refresh_in_background(boot: _BootRefresh) -> None:
         boot.ended.set()
 
 
-def _start_refresh(url: str, timeout: int, max_attempts: int, started: datetime) -> None:
-    boot: Final = _BootRefresh(url, timeout, max_attempts, started)
+def _start_refresh(boot: _BootRefresh) -> None:
     _LastBootRefresh.current = boot
     threading.Thread(
         target=_refresh_in_background, args=(boot,), name="litellm-model-cost-map-refresh", daemon=True
@@ -474,7 +450,7 @@ def _refresh_again_in_forked_child() -> None:
     """A fork copies no threads, so a child forked during the parent's refresh would serve the backup forever."""
     boot: Final = _LastBootRefresh.current
     if boot is not None and not boot.ended.is_set():
-        _start_refresh(boot.url, boot.timeout, boot.max_attempts, boot.started)
+        _start_refresh(_BootRefresh(boot.source, boot.url, boot.timeout, boot.max_attempts, boot.started))
 
 
 if hasattr(os, "register_at_fork"):
@@ -493,8 +469,8 @@ atexit.register(_stop_refresh_at_exit)
 
 def get_model_cost_map(
     url: str,
-    timeout: int = 5,
-    max_attempts: int = MODEL_COST_MAP_FETCH_MAX_ATTEMPTS,
+    timeout: float | None = None,
+    max_attempts: int | None = None,
     sleep: object = None,
     rng: object = None,
     client: object = None,
@@ -513,13 +489,14 @@ def get_model_cost_map(
     """
     _warn_ignored_fetch_hooks(sleep, rng, client)
     started: Final = datetime.now(timezone.utc)
-    if _uses_bundled_map_only() or _is_cli_process():
+    source: Final = None if _is_cli_process() else _remote(url, use_http_settings=False)
+    if source is None:
         _mark_rows_with_rules_set("local", None, True, None, started)
         return _rows_with_rules_set(model_cost_inputs.install_bundled())
 
     _mark_rows_with_rules_set("local", url, False, None, started)
     if _is_uwsgi_process():
-        refreshed: Final = _refreshed(_BootRefresh(url, timeout, 1, started))
+        refreshed: Final = _refreshed(_BootRefresh(source, url, timeout, 1, started))
         if refreshed is not None:
             _mark_rows_with_rules_set("remote", url, False, None, started)
             return _rows_with_rules_set(model_cost_inputs.install_refreshed(refreshed))
@@ -527,7 +504,7 @@ def get_model_cost_map(
 
     bundled: Final = model_cost_inputs.install_bundled()
     _set_fallback_rules(bundled.fallback_generalizations)
-    _start_refresh(url, timeout, max_attempts, started)
+    _start_refresh(_BootRefresh(source, url, timeout, max_attempts, started))
     return bundled.rows
 
 

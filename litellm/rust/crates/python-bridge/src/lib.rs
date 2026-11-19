@@ -75,7 +75,7 @@ mod _native {
     use crate::http::unsupported_tls_settings;
     #[pymodule_export]
     use crate::model_cost::{
-        CostMapRefreshStop, CostMapRefreshed, NativeCostMapSource, NativeFetchFailed,
+        CostMapKept, CostMapRefreshStop, CostMapRefreshed, NativeCostMapSource, NativeFetchFailed,
         NativeFetchPolicy, NativeFetched, NativeInstalled, NativeModelCostMap,
         NativeModelCostMapState, NativeProvenance, NativeRegistered, NativeRejected,
         NativeTableSwapped,
@@ -281,6 +281,7 @@ mod tests {
                 "NativeFetchFailed",
                 "CostMapRefreshed",
                 "CostMapRefreshStop",
+                "CostMapKept",
                 "TokenCounter",
                 "Tokenizer",
                 "RouterCoreHandle",

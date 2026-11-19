@@ -13,5 +13,6 @@
 - `install` touches no state until `CostMap::read` succeeds. `NativeRejected` means nothing changed
 - `register` keeps a registration only after its pass finished, so an exception in a host call keeps nothing
 - `rows=None` writes each entry into whichever table is published at that moment and never reports a swap
-- `fetch_blocking` runs on a throwaway runtime with an unpooled client so an importing process can still fork. `refresh` is for workers after the fork
-- `refresh` fetches and reads off the GIL and touches no state. `install_refreshed` is the only step that needs the GIL, since it builds the table
+- `refresh_blocking` and `fetch_blocking` run on a throwaway runtime with an unpooled client so an importing process can still fork. `refresh` is for workers after the fork
+- `refresh_blocking` and `refresh` fetch and read off the GIL and touch no state. `install_refreshed` is the only step that needs the GIL, since it builds the table
+- A blocking refresh runs on a daemon thread, and a thread that comes back from native code once the interpreter is finalizing aborts the process on Linux. `CostMapRefreshStop.stop` ends the fetch and returns only after `refresh_blocking` has left native code, so Python calls it from `atexit`. Each refresh takes a stop of its own, so a forked child never waits on a lock its parent's thread held

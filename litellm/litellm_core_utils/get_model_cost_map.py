@@ -9,6 +9,7 @@ export LITELLM_LOCAL_MODEL_COST_MAP=True
 ```
 """
 
+import atexit
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ import sys
 import threading
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.resources import files
@@ -43,6 +44,7 @@ from litellm.litellm_core_utils.model_cost_table import (
 from litellm.litellm_core_utils.offline_mode import is_offline_mode
 from litellm.rust_bridge._native import (
     CostMapRefreshed,
+    CostMapRefreshStop,
     NativeCostMapSource,
     NativeFetchFailed,
     NativeFetchPolicy,
@@ -68,6 +70,10 @@ model_cost_inputs: Final = NativeModelCostMap.bundled(
 
 def _is_cli_process() -> bool:
     return Path(sys.argv[0]).stem in _CLI_ENTRYPOINT_NAMES
+
+
+def _is_uwsgi_process() -> bool:
+    return "uwsgi" in sys.modules
 
 
 def _uses_bundled_map_only() -> bool:
@@ -386,29 +392,103 @@ async def refetch_model_cost_map(
     return ModelCostMapReloaded(model_count=_install(model_cost_inputs.install_refreshed(refreshed)))
 
 
-def _retry_remote_fetch_in_background(
-    url: str, timeout: int, max_attempts: int, first_failure: NativeFetchFailed
-) -> None:
-    try:
-        fetched: Final = cost_map_source(url, use_http_settings=False).fetch_blocking(
-            fetch_policy(timeout, max_attempts), first_failure
+@dataclass(frozen=True, slots=True)
+class _BootRefresh:
+    """The background refresh a boot load started. ``ended`` lets a forked child tell whether it finished, and
+    ``stop`` ends its download when the interpreter exits."""
+
+    url: str
+    timeout: int
+    max_attempts: int
+    started: datetime
+    ended: threading.Event = field(default_factory=threading.Event)
+    stop: CostMapRefreshStop = field(default_factory=CostMapRefreshStop)
+
+
+class _LastBootRefresh:
+    current: _BootRefresh | None = None
+
+
+def _replaced_by_a_later_load(boot: _BootRefresh) -> bool:
+    """A reload that finished while this boot refresh was downloading owns the table and the source info."""
+    return _LastLoad.current.loaded_at != boot.started
+
+
+def _refreshed(boot: _BootRefresh) -> CostMapRefreshed | None:
+    """The document at ``boot.url``. ``None`` after recording why the local backup stays, and also when the refresh
+    was stopped or a later load replaced this one."""
+    refreshed: Final = model_cost_inputs.refresh_blocking(
+        cost_map_source(boot.url, use_http_settings=False), fetch_policy(boot.timeout, boot.max_attempts), boot.stop
+    )
+    if refreshed is None or _replaced_by_a_later_load(boot):
+        return None
+    if isinstance(refreshed, NativeFetchFailed):
+        verbose_logger.warning(
+            "LiteLLM: Failed to fetch remote model cost map from %s: %s. Keeping the local backup.",
+            boot.url,
+            refreshed.reason,
         )
-        if isinstance(fetched, NativeFetchFailed):
-            verbose_logger.warning(
-                "LiteLLM: Failed to fetch remote model cost map from %s after %d attempts; keeping local backup",
-                url,
-                max_attempts,
-            )
+        _mark_rows_with_rules_set("local", boot.url, False, f"Remote fetch failed: {refreshed.reason}", boot.started)
+        return None
+    if isinstance(refreshed, NativeRejected):
+        _warn_rejected(refreshed, boot.url)
+        _mark_rows_with_rules_set(
+            "local",
+            boot.url,
+            False,
+            "Remote data failed integrity validation"
+            if refreshed.integrity
+            else f"Remote fetch failed: {_rejected_reason(refreshed, boot.url)}",
+            boot.started,
+        )
+        return None
+    return refreshed
+
+
+def _refresh_in_background(boot: _BootRefresh) -> None:
+    try:
+        refreshed: Final = _refreshed(boot)
+        if refreshed is None:
             return
         _litellm_import_complete.wait()
-        installed: Final = model_cost_inputs.install(fetched.body, fetched.etag)
-        if isinstance(installed, NativeRejected):
-            _warn_rejected(installed, url)
+        if _replaced_by_a_later_load(boot):
             return
-        _mark_rows_with_rules_set("remote", url, False, None, datetime.now(timezone.utc))
+        installed: Final = model_cost_inputs.install_refreshed(refreshed)
+        _mark_rows_with_rules_set("remote", boot.url, False, None, datetime.now(timezone.utc))
         _install(installed)
-    except Exception as e:  # noqa: BLE001  # a failed background retry must not kill the task; the backup stays
-        verbose_logger.warning("LiteLLM: Background model cost map retry failed: %s", e)
+    except Exception as e:  # noqa: BLE001  # a failed background refresh must not kill the thread; the backup stays
+        verbose_logger.warning("LiteLLM: Background model cost map refresh failed: %s", e)
+    finally:
+        boot.ended.set()
+
+
+def _start_refresh(url: str, timeout: int, max_attempts: int, started: datetime) -> None:
+    boot: Final = _BootRefresh(url, timeout, max_attempts, started)
+    _LastBootRefresh.current = boot
+    threading.Thread(
+        target=_refresh_in_background, args=(boot,), name="litellm-model-cost-map-refresh", daemon=True
+    ).start()
+
+
+def _refresh_again_in_forked_child() -> None:
+    """A fork copies no threads, so a child forked during the parent's refresh would serve the backup forever."""
+    boot: Final = _LastBootRefresh.current
+    if boot is not None and not boot.ended.is_set():
+        _start_refresh(boot.url, boot.timeout, boot.max_attempts, boot.started)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_refresh_again_in_forked_child)
+
+
+def _stop_refresh_at_exit() -> None:
+    """A daemon thread that comes back from the native refresh once the interpreter is finalizing aborts the process."""
+    boot: Final = _LastBootRefresh.current
+    if boot is not None:
+        boot.stop.stop()
+
+
+atexit.register(_stop_refresh_at_exit)
 
 
 def get_model_cost_map(
@@ -420,14 +500,16 @@ def get_model_cost_map(
     client: object = None,
 ) -> dict:
     """
-    Public entry point — returns the model cost map dict.
+    Public entry point: returns the bundled model cost map dict without waiting for the network.
 
     1. If ``LITELLM_LOCAL_MODEL_COST_MAP`` is set or this is a ``lite`` /
-       ``litellm-proxy`` CLI process, uses the local backup only.
-    2. Otherwise fetches from ``url`` once, retrying transient HTTP errors
-       (429/5xx/transport) with Retry-After-aware backoff in a background
-       thread, validates integrity, and falls back to the local backup on any
-       failure.
+       ``litellm-proxy`` CLI process, the bundled map is all there is.
+    2. Otherwise a background thread fetches ``url``, retrying transient HTTP
+       errors (429/5xx/transport) with Retry-After-aware backoff, validates
+       integrity, and installs the result as ``litellm.model_cost``. On any
+       failure the bundled map stays and the source info says why.
+    3. Under uWSGI the fetch is one attempt made before returning. Its master
+       forks the workers without the thread, so they would never get the map.
     """
     _warn_ignored_fetch_hooks(sleep, rng, client)
     started: Final = datetime.now(timezone.utc)
@@ -435,36 +517,18 @@ def get_model_cost_map(
         _mark_rows_with_rules_set("local", None, True, None, started)
         return _rows_with_rules_set(model_cost_inputs.install_bundled())
 
-    fetched: Final = cost_map_source(url, use_http_settings=False).fetch_blocking(fetch_policy(timeout, 1))
-    if isinstance(fetched, NativeFetchFailed):
-        if fetched.retryable and max_attempts > 1:
-            threading.Thread(
-                target=_retry_remote_fetch_in_background,
-                args=(url, timeout, max_attempts, fetched),
-                name="litellm-model-cost-map-retry",
-                daemon=True,
-            ).start()
-        verbose_logger.warning(
-            "LiteLLM: Failed to fetch remote model cost map from %s: %s. Falling back to local backup.",
-            url,
-            fetched.reason,
-        )
-        _mark_rows_with_rules_set("local", url, False, f"Remote fetch failed: {fetched.reason}", started)
+    _mark_rows_with_rules_set("local", url, False, None, started)
+    if _is_uwsgi_process():
+        refreshed: Final = _refreshed(_BootRefresh(url, timeout, 1, started))
+        if refreshed is not None:
+            _mark_rows_with_rules_set("remote", url, False, None, started)
+            return _rows_with_rules_set(model_cost_inputs.install_refreshed(refreshed))
         return _rows_with_rules_set(model_cost_inputs.install_bundled())
 
-    installed: Final = model_cost_inputs.install(fetched.body, fetched.etag)
-    if isinstance(installed, NativeRejected):
-        _warn_rejected(installed, url)
-        fallback_reason: Final = (
-            "Remote data failed integrity validation"
-            if installed.integrity
-            else f"Remote fetch failed: {_rejected_reason(installed, url)}"
-        )
-        _mark_rows_with_rules_set("local", url, False, fallback_reason, started)
-        return _rows_with_rules_set(model_cost_inputs.install_bundled())
-
-    _mark_rows_with_rules_set("remote", url, False, None, started)
-    return _rows_with_rules_set(installed)
+    bundled: Final = model_cost_inputs.install_bundled()
+    _set_fallback_rules(bundled.fallback_generalizations)
+    _start_refresh(url, timeout, max_attempts, started)
+    return bundled.rows
 
 
 def registration_rows(body: bytes) -> dict[str, dict[str, object]]:  # mutable-ok: register_model merges these rows

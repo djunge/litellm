@@ -118,6 +118,15 @@ fn aliases(deployments: &[Arc<Deployment>], catalog: &Catalog) -> Vec<(String, B
 }
 
 impl Admit {
+    /// Rereads which model groups `catalog` holds as another model's alias, for a newer cost map.
+    pub(crate) fn realias(&self, catalog: &Catalog) {
+        let deployments = self
+            .router
+            .registry()
+            .deployments(&DeploymentFilter::default());
+        self.aliased.store(Arc::new(aliases(&deployments, catalog)));
+    }
+
     /// By the `config` the native app `state` is built from, with its environment under it as
     /// `load_config` leaves it, and the `environment` `main` read.
     pub fn new(config: &Config, environment: &Environment, state: &AppState) -> Self {

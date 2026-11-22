@@ -110,6 +110,11 @@ fn variables(environment: &Environment) -> impl Iterator<Item = Box<str>> + use<
         default_cooldown_time_seconds,
         default_cooldown_redis_read_interval_seconds: _,
         default_max_redis_batch_cache_size: _,
+        litellm_local_model_cost_map: _,
+        litellm_offline_mode: _,
+        model_cost_map_min_model_count: _,
+        model_cost_map_max_shrink_ratio: _,
+        aws_region_name: _,
     } = environment;
     set!(
         "",
@@ -130,6 +135,15 @@ fn variables(environment: &Environment) -> impl Iterator<Item = Box<str>> + use<
         ]
     )
     .map(|field| field.to_uppercase().into())
+}
+
+/// Python fetches the cost map at import from `LITELLM_MODEL_COST_MAP_URL`, as the native app
+/// does at boot, and reads `litellm_settings.model_cost_map_url` from config.yaml only on a reload.
+fn set_by_its_variable(config: &Config) -> bool {
+    config
+        .origins
+        .variable("litellm_settings.model_cost_map_url")
+        .is_some()
 }
 
 /// The database settings are read as the proxy reads them, and what the proxy holds in its
@@ -355,7 +369,6 @@ fn litellm(config: &Config) -> impl Iterator<Item = Box<str>> + '_ {
             success_callback,
             failure_callback,
             anthropic_prompt_caching_ttl,
-            model_cost_map_url,
             anthropic_beta_headers_url,
         ],
         on: [
@@ -364,7 +377,11 @@ fn litellm(config: &Config) -> impl Iterator<Item = Box<str>> + '_ {
             enable_anthropic_prompt_caching,
             reasoning_auto_summary,
         ],
-        by: [callbacks => other_callbacks, priority_reservation_settings => borrows]
+        by: [
+            callbacks => other_callbacks,
+            priority_reservation_settings => borrows,
+            model_cost_map_url => |url: &Option<_>| url.is_some() && !set_by_its_variable(config)
+        ]
     )
     .chain(unknown("litellm_settings.", additional_fields))
     .map(|key| spelled(config, key))
@@ -519,6 +536,23 @@ mod tests {
             found(&set_by("LITELLM_DROP_PARAMS", "true")),
             Vec::<String>::new()
         );
+    }
+
+    #[rstest]
+    #[case::by_its_variable(
+        set_by("LITELLM_MODEL_COST_MAP_URL", "https://cost-map.test/map.json"),
+        &[]
+    )]
+    #[case::in_the_config(
+        Config::from_yaml("litellm_settings:\n  model_cost_map_url: https://cost-map.test/map.json\n")
+            .unwrap(),
+        &["litellm_settings.model_cost_map_url"]
+    )]
+    fn the_cost_map_url_is_honored_only_where_the_proxy_fetches_at_boot_from(
+        #[case] config: Config,
+        #[case] named: &[&str],
+    ) {
+        assert_eq!(found(&config), named);
     }
 
     #[rstest]

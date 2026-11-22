@@ -1,6 +1,7 @@
 mod admit;
 mod boot;
 mod callbacks;
+mod cost_map;
 mod db;
 mod error;
 mod health;
@@ -18,6 +19,7 @@ pub use callbacks::{
     model_capacity::{self, ModelCapacity},
     parallel_request_limiter::{self, KeyLimiter},
 };
+pub use cost_map::CostMapRefresh;
 pub use error::Error;
 pub use redis::RedisClients;
 pub use resources::Resources;

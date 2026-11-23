@@ -10,14 +10,15 @@ mod checks;
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::{body::Body, extract::Request, http::request::Parts};
 use litellm_config::{Config, Environment};
 use litellm_core_utils::get_llm_provider_logic::LlmProviders;
 use litellm_gateway_auth::{Auth, Authenticated, Preauthenticated};
 use litellm_gateway_auth_core::authz::Layer;
 use litellm_gateway_inference::{JsonObject, routing};
-use litellm_model_catalog::CostMap;
-use litellm_router_core::{Router, registry::DeploymentFilter};
+use litellm_model_catalog::{Catalog, CostMap};
+use litellm_router_core::{Deployment, Router, registry::DeploymentFilter};
 use serde_json::{Map, Value};
 
 use crate::{
@@ -75,7 +76,7 @@ pub struct Admit {
     deployed: Vec<Deployed>,
     /// The model group of each deployment whose model the cost map holds as another model's alias,
     /// with the name it holds it under.
-    aliased: Vec<(String, Box<str>)>,
+    aliased: ArcSwap<Vec<(String, Box<str>)>>,
     /// The router the native app serves through, which says where a request for a name can be
     /// served and what a call served there asks of its host.
     router: Router,
@@ -106,6 +107,16 @@ fn token_estimate(
         .then(|| Reason::new(Refused::Body, "media_under_a_token_limit"))
 }
 
+fn aliases(deployments: &[Arc<Deployment>], catalog: &Catalog) -> Vec<(String, Box<str>)> {
+    deployments
+        .iter()
+        .filter_map(|deployment| {
+            let alias = checks::alias(catalog, deployment.provider(), &deployment.params.model)?;
+            Some((deployment.model_name.clone(), alias))
+        })
+        .collect()
+}
+
 impl Admit {
     /// By the `config` the native app `state` is built from, with its environment under it as
     /// `load_config` leaves it, and the `environment` `main` read.
@@ -115,18 +126,6 @@ impl Admit {
             .router
             .registry()
             .deployments(&DeploymentFilter::default());
-        let cost_map = CostMap::bundled();
-        let aliased = deployments
-            .iter()
-            .filter_map(|deployment| {
-                let alias = checks::alias(
-                    cost_map.catalog(),
-                    deployment.provider(),
-                    &deployment.params.model,
-                )?;
-                Some((deployment.model_name.clone(), alias))
-            })
-            .collect();
         let deployed = deployments
             .iter()
             .map(|deployment| {
@@ -146,7 +145,7 @@ impl Admit {
                 .get(STORE_MODEL_IN_DB)
                 .map(|_| STORE_MODEL_IN_DB.into()),
             auth: state.auth(config),
-            aliased,
+            aliased: ArcSwap::from_pointee(aliases(&deployments, CostMap::bundled().catalog())),
             inference: Some(state.inference.clone()),
             ..Self::built(config, state.inference.router.clone(), deployed)
         }
@@ -165,7 +164,7 @@ impl Admit {
             environment: Environment::default(),
             stored_models: None,
             deployed,
-            aliased: Vec::new(),
+            aliased: ArcSwap::default(),
             inference: None,
         }
     }

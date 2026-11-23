@@ -123,8 +123,19 @@ pub(crate) async fn router(
             Install::Replace,
         )
         .await?;
+    let shaping = shapes(&router, config, catalog);
+    Ok((router, shaping))
+}
+
+/// How the messages route shapes a call to each deployment of `router`, by id, as `catalog`
+/// describes their models.
+pub(crate) fn shapes(
+    router: &Router,
+    config: &Config,
+    catalog: &Catalog,
+) -> HashMap<String, MessagesShaping> {
     let drops_params_globally = config.litellm_settings.drop_params == Some(true);
-    let shaping = router
+    router
         .registry()
         .deployments(&DeploymentFilter::default())
         .iter()
@@ -134,8 +145,7 @@ pub(crate) async fn router(
                 shaping(deployment, catalog, drops_params_globally),
             )
         })
-        .collect();
-    Ok((router, shaping))
+        .collect()
 }
 
 /// The router `config` describes with no host behind its build, for a test that asks it only what

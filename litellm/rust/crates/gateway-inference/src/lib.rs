@@ -26,6 +26,7 @@ mod test_support;
 
 use std::{collections::HashMap, sync::Arc};
 
+use arc_swap::ArcSwap;
 use axum::{Router, routing::post};
 use litellm_http::{ClientVariant, HttpClientConfig, media::UrlPolicy};
 use litellm_inference::resources::CoreResources;
@@ -50,7 +51,7 @@ pub struct Gateway<H> {
     cache: Option<Arc<dyn litellm_cache_response::ResponseCacheService>>,
     routing: Arc<RoutingCache>,
     /// How the messages route shapes a call to each deployment, by deployment id.
-    shaping: HashMap<String, MessagesShaping>,
+    shaping: ArcSwap<HashMap<String, MessagesShaping>>,
     pub messages: MessagesRoute,
     pub ocr: OcrRoute,
     pub router: litellm_router_core::Router,
@@ -74,7 +75,12 @@ impl<H: Host> Gateway<H> {
 
     /// How the messages route shapes a call to deployment `id`.
     pub(crate) fn shaping(&self, id: &str) -> MessagesShaping {
-        self.shaping.get(id).cloned().unwrap_or_default()
+        self.shaping.load().get(id).cloned().unwrap_or_default()
+    }
+
+    /// Replaces how the messages route shapes each deployment's calls, for a newer cost map.
+    pub fn reshape(&self, shaping: HashMap<String, MessagesShaping>) {
+        self.shaping.store(Arc::new(shaping));
     }
 
     pub fn new(
@@ -92,7 +98,7 @@ impl<H: Host> Gateway<H> {
             host,
             cache: None,
             routing: Arc::new(routing),
-            shaping,
+            shaping: ArcSwap::from_pointee(shaping),
             messages: MessagesRoute::new(provider, auth.clone(), secrets.clone()),
             ocr: OcrRoute::new(OcrClient::new(
                 &resources.pool,

@@ -9,6 +9,7 @@ repository.workspace = true
 test-support = []
 
 [dependencies]
+arc-swap.workspace = true
 litellm-python-compat.workspace = true
 litellm-env.workspace = true
 litellm-secret-value.workspace = true

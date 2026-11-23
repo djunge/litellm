@@ -82,6 +82,7 @@ fn unserved(admit: &Admit, reached: &Reached) -> Option<Box<str>> {
         .or_else(|| {
             admit
                 .aliased
+                .load()
                 .iter()
                 .find(|(aliased, _)| aliased == group)
                 .map(|(_, alias)| format!("model_list.litellm_params.model alias {alias}").into())

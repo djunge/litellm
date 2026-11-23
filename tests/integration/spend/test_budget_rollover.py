@@ -164,6 +164,11 @@ def test_cancelled_cap_clear_preserves_member_credits_until_retry(rollover_proxy
                 bool,
             )
             assert waiter is not None
+            assert observer.execute(
+                'SELECT user_id FROM "LiteLLM_TeamMembership" WHERE team_id = %s AND user_id IN (%s, %s) '
+                "FOR UPDATE SKIP LOCKED",
+                (team, *members),
+            ).fetchall() == []
             assert observer.execute("SELECT pg_cancel_backend(%s)", waiter).fetchone() == (True,)
             rejected: Final = update.result(timeout=15)
             assert rejected.status_code == 500, rejected.text

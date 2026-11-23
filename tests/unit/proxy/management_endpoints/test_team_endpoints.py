@@ -3251,7 +3251,7 @@ async def test_upsert_team_member_budget_table_no_existing_budget():
     )
 
     team_table = MagicMock(spec=LiteLLM_TeamTable)
-    team_table.metadata = {}
+    team_table.metadata = None
     team_table.team_alias = "Test Team"
     team_table.budget_duration = None
 
@@ -3281,6 +3281,7 @@ async def test_upsert_team_member_budget_table_no_existing_budget():
         assert mock_new_budget.called
         assert "team_member_budget_id" in result["metadata"]
         assert result["metadata"]["team_member_budget_id"] == "new_budget_456"
+        assert team_table.metadata is None
 
         assert "team_member_budget" not in result
         assert "team_member_budget_duration" not in result
